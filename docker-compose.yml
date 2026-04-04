@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  goindexer:
+    image: ghcr.io/yourusername/goindexer:latest
+    # Or build locally:
+    # build: .
+    
+    container_name: goindexer
+    
+    # Map volumes to persist data
+    volumes:
+      - ./data:/app/data          # HTML files saved here
+      - ./db:/app/db              # SQLite database here
+      - ./.env:/app/.env:ro       # Mount .env as read-only
+    
+    # Environment variables (alternative to .env file)
+    # environment:
+    #   - STARTING_URL=https://en.wikipedia.org/wiki/Main_Page
+    #   - NUM_WORKERS=10
+    #   - DEFAULT_CRAWL_DELAY_MS=2000
+    
+    restart: unless-stopped
+    
+    # Resource limits (optional but recommended)
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 4G
+        reservations:
+          memory: 512M
+
+# For larger deployments, you might want separate volumes:
+# volumes:
+#   goindexer_data:
+#   goindexer_db:

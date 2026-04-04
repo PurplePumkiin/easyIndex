@@ -1,0 +1,55 @@
+# Environment files - NEVER commit these
+.env
+.env.*
+!.env.example
+
+# Database files - contains crawled data
+db/
+*.db
+*.db-shm
+*.db-wal
+
+# Data directory - contains downloaded HTML
+data/
+
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+GOindexer
+main
+
+# Go test files
+*.test
+*.out
+
+# Go workspace file
+go.work
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS files
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Docker
+.dockerignore
+
+# CI/CD artifacts
+.github/workflows/*.log
