@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,6 +21,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 
 	"github.com/PuerkitoBio/goquery"
+	"github.com/fatih/color"
 	"github.com/joho/godotenv"
 	"github.com/temoto/robotstxt"
 )
@@ -536,14 +538,33 @@ func claimNextDomain(db *sql.DB, workerID int) (string, int, error) {
 	if crawlDelay.Valid {
 		delay = int(crawlDelay.Int64)
 	}
-	fmt.Printf("Worker %d claimed domain %s\n", workerID, domain)
 	return domain, delay, nil
+}
+
+func getWorkerColor() *color.Color {
+	colors := []*color.Color{
+		color.New(color.FgCyan),
+		color.New(color.FgGreen),
+		color.New(color.FgYellow),
+		color.New(color.FgBlue),
+		color.New(color.FgMagenta),
+		color.New(color.FgRed),
+		color.New(color.FgHiCyan),
+		color.New(color.FgHiGreen),
+		color.New(color.FgHiYellow),
+		color.New(color.FgHiBlue),
+		color.New(color.FgHiMagenta),
+		color.New(color.FgHiRed),
+	}
+	return colors[rand.Intn(len(colors))]
 }
 
 func worker(workerID int, db *sql.DB, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	fmt.Printf("Worker %d started\n", workerID)
+	// Randomly assign color to this worker
+	c := getWorkerColor()
+	c.Printf("Worker %d started\n", workerID)
 
 	for {
 		// Attempt to claim the next available domain
@@ -552,11 +573,12 @@ func worker(workerID int, db *sql.DB, wg *sync.WaitGroup) {
 			time.Sleep(5 * time.Second)
 			continue
 		}
+		c.Printf("Worker %d claimed domain %s\n", workerID, domain)
 
 		// Robots
 		robotsTXT, err := getDomainRobotsTXT(db, domain)
 		if err != nil || robotsTXT == "" {
-			fmt.Printf("(WORKER_%d) Fetching robots.txt for %s\n", workerID, domain)
+			c.Printf("(WORKER_%d) Fetching robots.txt for %s\n", workerID, domain)
 			robotsTXT, err = fetchRobotsTXT(domain)
 			if err != nil {
 				log.Printf("(WORKER_%d) Failed to fetch robots.txt for %s: %v", workerID, domain, err)
@@ -571,19 +593,20 @@ func worker(workerID int, db *sql.DB, wg *sync.WaitGroup) {
 			//Next URL
 			urlStr, err := getNextURLForDomain(db, domain)
 			if err != nil {
-				fmt.Printf("(WORKER_%d) No more URLs to process for domain %s\n", workerID, domain)
+				c.Printf("(WORKER_%d) No more URLs to process for domain %s\n", workerID, domain)
 				break
 			}
 
 			// Check domain against robots.txt
 			allowed, _ := canCrawlURL(robotsTXT, urlStr)
 			if !allowed {
-				fmt.Printf("(WORKER_%d) URL %s disallowed by robots.txt for domain %s\n", workerID, urlStr, domain)
+				c.Printf("(WORKER_%d) URL %s disallowed by robots.txt for domain %s\n", workerID, urlStr, domain)
+				markURLSkipped(db, urlStr, "disallowed by robots.txt")
 				continue
 			}
 
 			// Fetch Url
-			fmt.Printf("(WORKER_%d) Fetching URL %s for domain %s\n", workerID, urlStr, domain)
+			c.Printf("(WORKER_%d) Fetching URL %s for domain %s\n", workerID, urlStr, domain)
 			resp, doc, bodyBytes, err := fetchURL(urlStr)
 			if err != nil {
 				log.Printf("(WORKER_%d) Failed to fetch URL %s for domain %s: %v", workerID, urlStr, domain, err)
@@ -607,7 +630,7 @@ func worker(workerID int, db *sql.DB, wg *sync.WaitGroup) {
 
 				refreshClaim(db, domain, workerID)
 
-				fmt.Printf("(WORKER_%d) STATUS %d, Links found: %d\n", workerID, resp.StatusCode, len(links))
+				c.Printf("(WORKER_%d) STATUS %d, Links found: %d\n", workerID, resp.StatusCode, len(links))
 			}
 			// Respect crawl delay
 			time.Sleep(time.Duration(crawlDelay) * time.Second)
