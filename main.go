@@ -53,8 +53,33 @@ func main() {
 		log.Fatal("Failed to initialize database:", err)
 	}
 
+	// Run database migrations
+	err = runMigrations(db)
+	if err != nil {
+		log.Fatal("Failed to run migrations:", err)
+	}
+
 	// Seed the database with starting URL if empty
 	seedDatabaseIfEmpty(db)
+
+	// Start Analytics Service
+	analyticsEnabled := os.Getenv("ANALYTICS") == "true"
+	analyticsFrequency := getEnvInt("FREQUENCY", 3600) // Default 1 hour
+	analyticsService := NewAnalyticsService(db, analyticsFrequency, analyticsEnabled)
+	analyticsService.Start()
+
+	// Start API Service
+	apiEnabled := os.Getenv("API") == "true"
+	apiMode := os.Getenv("REQUEST_MODE") // GET or POST
+	apiPort := os.Getenv("PORT")
+	if apiPort == "" {
+		apiPort = "8080"
+	}
+	apiDestination := os.Getenv("DESTINATION")
+	apiFrequency := getEnvInt("API_FREQUENCY", 300) // Default 5 minutes for POST mode
+
+	apiService := NewAPIService(db, apiEnabled, apiMode, apiPort, apiDestination, apiFrequency)
+	apiService.Start()
 
 	// Main crawl loop
 	for {
@@ -89,6 +114,20 @@ func main() {
 		wg.Wait()
 		fmt.Println("All workers somehow done")
 	}
+}
+
+// getEnvInt gets an integer from environment variable with a default value
+func getEnvInt(key string, defaultValue int) int {
+	valStr := os.Getenv(key)
+	if valStr == "" {
+		return defaultValue
+	}
+	val, err := strconv.Atoi(valStr)
+	if err != nil {
+		log.Printf("Invalid %s value: %s, using default: %d", key, valStr, defaultValue)
+		return defaultValue
+	}
+	return val
 }
 
 func fetchURL(url string) (*http.Response, *goquery.Document, []byte, error) {
@@ -186,7 +225,19 @@ func initDB(db *sql.DB) error {
 		first_fetched TIMESTAMP,
 		claimed_by INTEGER,
 		claimed_at TIMESTAMP
-	)
+	);
+
+	CREATE TABLE IF NOT EXISTS domain_links (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		source_domain TEXT NOT NULL,
+		target_domain TEXT NOT NULL,
+		link_count INTEGER DEFAULT 0,
+		last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE(source_domain, target_domain)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_source_domain ON domain_links(source_domain);
+	CREATE INDEX IF NOT EXISTS idx_link_count ON domain_links(link_count DESC);
 	`
 
 	_, err := db.Exec(query)
@@ -261,8 +312,31 @@ func saveURL(db *sql.DB, urlStr string, fromURL string) error {
 		}
 	}
 
-	_, err = db.Exec(`INSERT OR IGNORE INTO urls (url, domain, from_url) VALUES (?, ?, ?)`, urlStr, domain, fromURL)
-	return err
+	// Insert URL (INSERT OR IGNORE means we only insert if URL doesn't exist)
+	result, err := db.Exec(`INSERT OR IGNORE INTO urls (url, domain, from_url) VALUES (?, ?, ?)`, urlStr, domain, fromURL)
+	if err != nil {
+		return err
+	}
+
+	// Check if URL was actually inserted (not a duplicate)
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected > 0 && fromURL != "" {
+		// New URL was inserted, check if it's a cross-domain link
+		sourceDomain, err := resolveDomain(fromURL)
+		if err == nil && sourceDomain != domain {
+			// Cross-domain link detected - increment counter
+			_, err = db.Exec(`
+				UPDATE domains 
+				SET total_links_out = total_links_out + 1 
+				WHERE domain = ?
+			`, sourceDomain)
+			if err != nil {
+				log.Printf("Warning: failed to increment link counter for %s: %v", sourceDomain, err)
+			}
+		}
+	}
+
+	return nil
 }
 
 func saveDomain(db *sql.DB, domain string, robots string, robotsFetched time.Time) error {
@@ -382,9 +456,26 @@ func markURLFailed(db *sql.DB, urlStr string, errMsg string) {
 }
 
 func markURLFetched(db *sql.DB, urlStr string) {
-	_, err := db.Exec(`UPDATE urls SET status = 'fetched', fetched_at = ? WHERE url = ?`, time.Now(), urlStr)
+	// Get the domain for this URL
+	domain, err := resolveDomain(urlStr)
+
+	// Update URL status
+	_, err = db.Exec(`UPDATE urls SET status = 'fetched', fetched_at = ? WHERE url = ?`, time.Now(), urlStr)
 	if err != nil {
 		log.Printf("Failed to mark URL %s as fetched: %v", urlStr, err)
+		return
+	}
+
+	// Increment fetched count for domain
+	if domain != "" {
+		_, err = db.Exec(`
+			UPDATE domains 
+			SET total_urls_fetched = total_urls_fetched + 1 
+			WHERE domain = ?
+		`, domain)
+		if err != nil {
+			log.Printf("Warning: failed to increment fetch counter for %s: %v", domain, err)
+		}
 	}
 }
 
