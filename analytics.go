@@ -54,12 +54,13 @@ func (a *AnalyticsService) analyzeDomainLinks() {
 	startTime := time.Now()
 	fmt.Println("🔍 Analytics: Starting domain link analysis (top 100 domains)...")
 
-	// Get top 100 domains by total_urls_fetched
+	// Top 100 registrable domains (sites) by total fetched URLs across all hosts
 	topDomainsQuery := `
-		SELECT domain
+		SELECT registrable_domain
 		FROM domains
-		WHERE total_urls_fetched > 0
-		ORDER BY total_urls_fetched DESC
+		GROUP BY registrable_domain
+		HAVING SUM(total_urls_fetched) > 0
+		ORDER BY SUM(total_urls_fetched) DESC
 		LIMIT 100
 	`
 
@@ -170,10 +171,10 @@ func GetTotalURLs(db *sql.DB) (int, error) {
 	return total, err
 }
 
-// GetTotalDomains returns the total number of domains discovered
+// GetTotalDomains returns the number of distinct registrable domains (sites) discovered
 func GetTotalDomains(db *sql.DB) (int, error) {
 	var total int
-	err := db.QueryRow(`SELECT COUNT(*) FROM domains`).Scan(&total)
+	err := db.QueryRow(`SELECT COUNT(DISTINCT registrable_domain) FROM domains`).Scan(&total)
 	return total, err
 }
 
@@ -191,27 +192,44 @@ type DomainStats struct {
 // GetDomainStats returns statistics for all domains (optimized with cached columns)
 func GetDomainStats(db *sql.DB) ([]DomainStats, error) {
 	query := `
-		SELECT 
-			d.domain,
-			COUNT(DISTINCT u.url) as urls_discovered,
-			COALESCE(d.total_urls_fetched, 0) as urls_fetched,
-			COALESCE(d.total_links_out, 0) as outgoing_links,
-			COALESCE(incoming.link_count, 0) as incoming_links,
-			COALESCE(outgoing.unique_targets, 0) as unique_targets
-		FROM domains d
-		LEFT JOIN urls u ON d.domain = u.domain
-		LEFT JOIN (
-			SELECT source_domain, COUNT(DISTINCT target_domain) as unique_targets
+		WITH site_totals AS (
+			SELECT
+				registrable_domain,
+				SUM(COALESCE(total_urls_fetched, 0)) AS urls_fetched,
+				SUM(COALESCE(total_links_out, 0)) AS outgoing_links
+			FROM domains
+			GROUP BY registrable_domain
+		),
+		discovered AS (
+			SELECT
+				domain AS registrable_domain,
+				COUNT(DISTINCT url) AS urls_discovered
+			FROM urls
+			GROUP BY domain
+		),
+		outgoing AS (
+			SELECT source_domain, COUNT(DISTINCT target_domain) AS unique_targets
 			FROM domain_links
 			GROUP BY source_domain
-		) outgoing ON d.domain = outgoing.source_domain
-		LEFT JOIN (
-			SELECT target_domain, SUM(link_count) as link_count
+		),
+		incoming AS (
+			SELECT target_domain, SUM(link_count) AS link_count
 			FROM domain_links
 			GROUP BY target_domain
-		) incoming ON d.domain = incoming.target_domain
-		GROUP BY d.domain
-		ORDER BY d.total_urls_fetched DESC
+		)
+		SELECT 
+			s.registrable_domain,
+			COALESCE(disc.urls_discovered, 0) as urls_discovered,
+			COALESCE(st.urls_fetched, 0) as urls_fetched,
+			COALESCE(st.outgoing_links, 0) as outgoing_links,
+			COALESCE(incoming.link_count, 0) as incoming_links,
+			COALESCE(outgoing.unique_targets, 0) as unique_targets
+		FROM (SELECT DISTINCT registrable_domain FROM domains) s
+		LEFT JOIN site_totals st ON st.registrable_domain = s.registrable_domain
+		LEFT JOIN discovered disc ON disc.registrable_domain = s.registrable_domain
+		LEFT JOIN outgoing ON s.registrable_domain = outgoing.source_domain
+		LEFT JOIN incoming ON s.registrable_domain = incoming.target_domain
+		ORDER BY urls_fetched DESC
 	`
 
 	rows, err := db.Query(query)
@@ -295,12 +313,13 @@ func GetGraphData(db *sql.DB, minLinks int) (*GraphData, error) {
 	// Get nodes (domains with their stats) - using cached columns for speed
 	nodeQuery := `
 		SELECT 
-			d.domain,
-			COALESCE(d.total_urls_fetched, 0) as url_count,
-			COALESCE(d.total_links_out, 0) as total_links
+			d.registrable_domain,
+			SUM(COALESCE(d.total_urls_fetched, 0)) as url_count,
+			SUM(COALESCE(d.total_links_out, 0)) as total_links
 		FROM domains d
-		WHERE d.total_links_out >= ?
-		ORDER BY d.total_links_out DESC
+		GROUP BY d.registrable_domain
+		HAVING SUM(COALESCE(d.total_links_out, 0)) >= ?
+		ORDER BY SUM(COALESCE(d.total_links_out, 0)) DESC
 	`
 
 	rows, err := db.Query(nodeQuery, minLinks)

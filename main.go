@@ -29,6 +29,7 @@ import (
 var domainRegistry map[string]int
 var registryMutex sync.Mutex
 var numWorkers int
+var maxWorkersPerSite int
 
 func main() {
 	// Load environment variables from .env file
@@ -99,7 +100,12 @@ func main() {
 			}
 		}
 
-		fmt.Printf("Starting %d workers...\n", numWorkers)
+		maxWorkersPerSite = getEnvInt("MAX_WORKERS_PER_SITE", 5)
+		if maxWorkersPerSite < 1 {
+			maxWorkersPerSite = 1
+		}
+
+		fmt.Printf("Starting %d workers (max %d per registrable site)...\n", numWorkers, maxWorkersPerSite)
 
 		// Create the WaitGroup to track workers
 		var wg sync.WaitGroup
@@ -198,11 +204,14 @@ func initDir() {
 	}
 }
 
+// initDB creates tables and safe indexes only. Indexes on host_domain / registrable_domain
+// are created in migration split_host_and_registrable_domain so old DBs still work before that migration runs.
 func initDB(db *sql.DB) error {
 	query := `
 	CREATE TABLE IF NOT EXISTS urls (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		url TEXT NOT NULL UNIQUE,
+		host_domain TEXT NOT NULL,
 		domain TEXT NOT NULL,
 		from_url TEXT,
 		status TEXT DEFAULT 'pending',
@@ -212,11 +221,12 @@ func initDB(db *sql.DB) error {
 	);
 	
 	CREATE INDEX IF NOT EXISTS inx_status ON urls(status);
-	CREATE INDEX IF NOT EXISTS idx_domain ON urls(domain);
+	CREATE INDEX IF NOT EXISTS idx_urls_registrable ON urls(domain);
 
 	CREATE TABLE IF NOT EXISTS domains (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		domain TEXT NOT NULL UNIQUE,
+		host_domain TEXT NOT NULL UNIQUE,
+		registrable_domain TEXT NOT NULL,
 		robots TEXT,
 		robots_fetched TIMESTAMP,
 		crawl_delay INTEGER DEFAULT 2,
@@ -224,7 +234,9 @@ func initDB(db *sql.DB) error {
 		rate_limit_reset TIMESTAMP,
 		first_fetched TIMESTAMP,
 		claimed_by INTEGER,
-		claimed_at TIMESTAMP
+		claimed_at TIMESTAMP,
+		total_links_out INTEGER DEFAULT 0,
+		total_urls_fetched INTEGER DEFAULT 0
 	);
 
 	CREATE TABLE IF NOT EXISTS domain_links (
@@ -259,26 +271,28 @@ func seedDatabaseIfEmpty(db *sql.DB) {
 			log.Fatal("Database is empty and STARTING_URL not set in .env")
 		}
 
+		startingURL, err = normalizeURLString(startingURL)
+		if err != nil {
+			log.Fatal("Failed to normalize STARTING_URL:", err)
+		}
+
 		fmt.Printf("Database empty, seeding with starting URL: %s\n", startingURL)
 
-		// Get domain and fetch robots txt
-		domain, err := resolveDomain(startingURL)
+		host, site, err := resolveHostAndSite(startingURL)
 		if err != nil {
 			log.Fatal("Failed to parse starting URL:", err)
 		}
 
-		// Fetch robots.txt for starting domain
-		robotsTxt, err := fetchRobotsTXT(domain)
+		// Fetch robots.txt for starting host
+		robotsTxt, err := fetchRobotsTXT(host)
 		if err != nil {
-			log.Printf("Failed to fetch robots.txt for starting domain: %v", err)
+			log.Printf("Failed to fetch robots.txt for starting host: %v", err)
 			robotsTxt = ""
 		}
 
-		// Save domain
-		saveDomain(db, domain, robotsTxt, time.Now())
+		saveDomain(db, host, site, robotsTxt, time.Now())
 
-		// Save starting URL
-		_, err = db.Exec(`INSERT INTO urls (url, domain, status) VALUES (?, ?, 'pending')`, startingURL, domain)
+		_, err = db.Exec(`INSERT INTO urls (url, host_domain, domain, status) VALUES (?, ?, ?, 'pending')`, startingURL, host, site)
 		if err != nil {
 			log.Fatal("Failed to seed database:", err)
 		}
@@ -288,50 +302,56 @@ func seedDatabaseIfEmpty(db *sql.DB) {
 }
 
 func saveURL(db *sql.DB, urlStr string, fromURL string) error {
-	domain, err := resolveDomain(urlStr)
+	var err error
+	urlStr, err = normalizeURLString(urlStr)
 	if err != nil {
 		return err
 	}
-
-	// Check if this is a new domain - if so, register it
-	var domainExists int
-	err = db.QueryRow(`SELECT COUNT(*) FROM domains WHERE domain = ?`, domain).Scan(&domainExists)
-	if err != nil {
-		return err
-	}
-
-	if domainExists == 0 {
-		// New domain discovered - fetch and save robots.txt
-		fmt.Printf("New domain discovered: %s, fetching robots.txt...\n", domain)
-		robotsTxt, err := fetchRobotsTXT(domain)
+	if fromURL != "" {
+		fromURL, err = normalizeURLString(fromURL)
 		if err != nil {
-			log.Printf("Failed to fetch robots.txt for new domain %s: %v", domain, err)
-			saveDomain(db, domain, "", time.Now()) // Save with empty robots
-		} else {
-			saveDomain(db, domain, robotsTxt, time.Now())
+			return err
 		}
 	}
 
-	// Insert URL (INSERT OR IGNORE means we only insert if URL doesn't exist)
-	result, err := db.Exec(`INSERT OR IGNORE INTO urls (url, domain, from_url) VALUES (?, ?, ?)`, urlStr, domain, fromURL)
+	host, site, err := resolveHostAndSite(urlStr)
 	if err != nil {
 		return err
 	}
 
-	// Check if URL was actually inserted (not a duplicate)
+	var hostExists int
+	err = db.QueryRow(`SELECT COUNT(*) FROM domains WHERE host_domain = ?`, host).Scan(&hostExists)
+	if err != nil {
+		return err
+	}
+
+	if hostExists == 0 {
+		fmt.Printf("New host discovered: %s (site %s), fetching robots.txt...\n", host, site)
+		robotsTxt, err := fetchRobotsTXT(host)
+		if err != nil {
+			log.Printf("Failed to fetch robots.txt for new host %s: %v", host, err)
+			saveDomain(db, host, site, "", time.Now())
+		} else {
+			saveDomain(db, host, site, robotsTxt, time.Now())
+		}
+	}
+
+	result, err := db.Exec(`INSERT OR IGNORE INTO urls (url, host_domain, domain, from_url) VALUES (?, ?, ?, ?)`, urlStr, host, site, fromURL)
+	if err != nil {
+		return err
+	}
+
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected > 0 && fromURL != "" {
-		// New URL was inserted, check if it's a cross-domain link
-		sourceDomain, err := resolveDomain(fromURL)
-		if err == nil && sourceDomain != domain {
-			// Cross-domain link detected - increment counter
+		sourceHost, sourceSite, err1 := resolveHostAndSite(fromURL)
+		if err1 == nil && sourceSite != site {
 			_, err = db.Exec(`
 				UPDATE domains 
 				SET total_links_out = total_links_out + 1 
-				WHERE domain = ?
-			`, sourceDomain)
+				WHERE host_domain = ?
+			`, sourceHost)
 			if err != nil {
-				log.Printf("Warning: failed to increment link counter for %s: %v", sourceDomain, err)
+				log.Printf("Warning: failed to increment link counter for %s: %v", sourceHost, err)
 			}
 		}
 	}
@@ -339,17 +359,9 @@ func saveURL(db *sql.DB, urlStr string, fromURL string) error {
 	return nil
 }
 
-func saveDomain(db *sql.DB, domain string, robots string, robotsFetched time.Time) error {
-	_, err := db.Exec(`INSERT OR IGNORE INTO domains (domain, robots, robots_fetched) VALUES (?, ?, ?)`, domain, robots, robotsFetched)
+func saveDomain(db *sql.DB, host string, site string, robots string, robotsFetched time.Time) error {
+	_, err := db.Exec(`INSERT OR IGNORE INTO domains (host_domain, registrable_domain, robots, robots_fetched) VALUES (?, ?, ?, ?)`, host, site, robots, robotsFetched)
 	return err
-}
-
-func resolveDomain(urlStr string) (string, error) {
-	u, err := url.Parse(urlStr)
-	if err != nil {
-		return "", err
-	}
-	return u.Host, nil
 }
 
 func resolveURL(baseURL, href string) (string, error) {
@@ -380,9 +392,9 @@ func isValidURL(urlStr string) bool {
 	return u.Scheme != "" && u.Host != ""
 }
 
-func fetchRobotsTXT(domain string) (string, error) {
+func fetchRobotsTXT(host string) (string, error) {
 	// Create a new HTTP GET request
-	req, err := http.NewRequest("GET", "https://"+domain+"/robots.txt", nil)
+	req, err := http.NewRequest("GET", "https://"+host+"/robots.txt", nil)
 	if err != nil {
 		return "", err
 	}
@@ -409,17 +421,17 @@ func fetchRobotsTXT(domain string) (string, error) {
 	return string(bodyBytes), nil
 }
 
-func getNextURLForDomain(db *sql.DB, domain string) (string, error) {
+func getNextURLForDomain(db *sql.DB, host string) (string, error) {
 	var url string
 	err := db.QueryRow(`
 		SELECT url
 		FROM urls
-		WHERE domain = ? AND status = 'pending'
+		WHERE host_domain = ? AND status = 'pending'
 		ORDER BY created_at ASC
 		LIMIT 1
-	`, domain).Scan(&url)
+	`, host).Scan(&url)
 	if err == sql.ErrNoRows {
-		return "", fmt.Errorf("no pending URLs for domain %s", domain)
+		return "", fmt.Errorf("no pending URLs for host %s", host)
 	}
 	return url, nil
 }
@@ -429,11 +441,11 @@ func getNextDomainWithPendingURLs(db *sql.DB) (string, int, error) {
 	var crawlDelay sql.NullInt64
 
 	err := db.QueryRow(`
-		SELECT d.domain, d.crawl_delay
+		SELECT d.host_domain, d.crawl_delay
 		FROM domains d
-		INNER JOIN urls u on d.domain = u.domain
+		INNER JOIN urls u ON d.host_domain = u.host_domain
 		WHERE u.status = 'pending'
-		GROUP BY d.domain
+		GROUP BY d.host_domain
 		ORDER BY MIN(u.created_at) ASC
 		LIMIT 1
 	`).Scan(&domain, &crawlDelay)
@@ -456,34 +468,34 @@ func markURLFailed(db *sql.DB, urlStr string, errMsg string) {
 }
 
 func markURLFetched(db *sql.DB, urlStr string) {
-	// Get the domain for this URL
-	domain, err := resolveDomain(urlStr)
+	host, herr := hostFromURLString(urlStr)
+	if herr != nil {
+		host = ""
+	}
 
-	// Update URL status
-	_, err = db.Exec(`UPDATE urls SET status = 'fetched', fetched_at = ? WHERE url = ?`, time.Now(), urlStr)
+	_, err := db.Exec(`UPDATE urls SET status = 'fetched', fetched_at = ? WHERE url = ?`, time.Now(), urlStr)
 	if err != nil {
 		log.Printf("Failed to mark URL %s as fetched: %v", urlStr, err)
 		return
 	}
 
-	// Increment fetched count for domain
-	if domain != "" {
+	if host != "" {
 		_, err = db.Exec(`
 			UPDATE domains 
 			SET total_urls_fetched = total_urls_fetched + 1 
-			WHERE domain = ?
-		`, domain)
+			WHERE host_domain = ?
+		`, host)
 		if err != nil {
-			log.Printf("Warning: failed to increment fetch counter for %s: %v", domain, err)
+			log.Printf("Warning: failed to increment fetch counter for %s: %v", host, err)
 		}
 	}
 }
 
-func getDomainRobotsTXT(db *sql.DB, domain string) (string, error) {
+func getDomainRobotsTXT(db *sql.DB, host string) (string, error) {
 	var robotsTXT string
 	err := db.QueryRow(`
-		SELECT robots FROM domains WHERE domain = ?
-	`, domain).Scan(&robotsTXT)
+		SELECT robots FROM domains WHERE host_domain = ?
+	`, host).Scan(&robotsTXT)
 
 	if err != nil {
 		return "", nil
@@ -543,39 +555,37 @@ func saveBodyToDisk(urlStr string, body []byte) error {
 	return os.WriteFile(filePath, body, 0644)
 }
 
-func releaseDomain(db *sql.DB, domain string, workerID int) {
+func releaseDomain(db *sql.DB, host string, workerID int) {
 	registryMutex.Lock()
 	defer registryMutex.Unlock()
 
-	// Check ownership
-	if domainRegistry[domain] != workerID {
-		log.Printf("Worker %d attempted to release domain, but doesn't own it", workerID)
+	if domainRegistry[host] != workerID {
+		log.Printf("Worker %d attempted to release host claim, but doesn't own it", workerID)
 		return
 	}
-	delete(domainRegistry, domain)
+	delete(domainRegistry, host)
 
-	// Notify DB that the domain is now free for other workers
 	_, err := db.Exec(`
 		UPDATE domains
 		SET claimed_by = NULL, claimed_at = NULL
-		WHERE domain = ? AND claimed_by = ?
-	`, domain, workerID)
+		WHERE host_domain = ? AND claimed_by = ?
+	`, host, workerID)
 
 	if err != nil {
-		log.Printf("Failed to relase domain %s by worker %d: %v", domain, workerID, err)
+		log.Printf("Failed to relase host %s by worker %d: %v", host, workerID, err)
 	} else {
-		fmt.Printf("Worker %d successfully released domain %s\n", workerID, domain)
+		fmt.Printf("Worker %d successfully released host %s\n", workerID, host)
 	}
 }
 
-func refreshClaim(db *sql.DB, domain string, workerID int) {
+func refreshClaim(db *sql.DB, host string, workerID int) {
 	_, err := db.Exec(`
 		UPDATE domains
 		SET claimed_at = CURRENT_TIMESTAMP
-		WHERE domain = ? and claimed_by = ?
-	`, domain, workerID)
+		WHERE host_domain = ? AND claimed_by = ?
+	`, host, workerID)
 	if err != nil {
-		log.Printf("Worker %d failed to refresh claim on %s: %v", workerID, domain, err)
+		log.Printf("Worker %d failed to refresh claim on %s: %v", workerID, host, err)
 	}
 }
 
@@ -583,21 +593,27 @@ func claimNextDomain(db *sql.DB, workerID int) (string, int, error) {
 	registryMutex.Lock()
 	defer registryMutex.Unlock()
 
-	var domain string
+	var host string
 	var crawlDelay sql.NullInt64
 
-	// Find unclaimed valid domain with pending work
 	err := db.QueryRow(`
-		SELECT d.domain, d.crawl_delay
+		SELECT d.host_domain, d.crawl_delay
 		FROM domains d
-		INNER JOIN urls u on d.domain = u.domain
+		INNER JOIN urls u ON d.host_domain = u.host_domain
 		WHERE u.status = 'pending'
 			AND (d.claimed_by IS NULL
-				OR d.claimed_at < datetime("now", "-5 minutes"))
-		GROUP BY d.domain
+				OR d.claimed_at < datetime('now', '-5 minutes'))
+			AND (
+				SELECT COUNT(DISTINCT cx.claimed_by)
+				FROM domains cx
+				WHERE cx.registrable_domain = d.registrable_domain
+					AND cx.claimed_by IS NOT NULL
+					AND cx.claimed_at >= datetime('now', '-5 minutes')
+			) < ?
+		GROUP BY d.host_domain
 		ORDER BY MIN(u.created_at) ASC
 		LIMIT 1
-	`).Scan(&domain, &crawlDelay)
+	`, maxWorkersPerSite).Scan(&host, &crawlDelay)
 
 	if err == sql.ErrNoRows {
 		return "", 0, fmt.Errorf("no available domains")
@@ -606,30 +622,28 @@ func claimNextDomain(db *sql.DB, workerID int) (string, int, error) {
 		return "", 0, err
 	}
 
-	if existingWorker, exists := domainRegistry[domain]; exists {
-		log.Printf("Domain %s claimed by worker %d in registry but not DB!", domain, existingWorker)
-		return "", 0, fmt.Errorf("domain claimed by another worker")
+	if existingWorker, exists := domainRegistry[host]; exists {
+		log.Printf("Host %s claimed by worker %d in registry but not DB!", host, existingWorker)
+		return "", 0, fmt.Errorf("host claimed by another worker")
 	}
 
-	// CLAIM in DB
 	_, err = db.Exec(`
 		UPDATE domains
 		SET claimed_by = ?, claimed_at = CURRENT_TIMESTAMP
-		WHERE domain = ?
-	`, workerID, domain)
+		WHERE host_domain = ?
+	`, workerID, host)
 
 	if err != nil {
 		return "", 0, err
 	}
 
-	// CLAIM in registry
-	domainRegistry[domain] = workerID
+	domainRegistry[host] = workerID
 
 	delay := 2
 	if crawlDelay.Valid {
 		delay = int(crawlDelay.Int64)
 	}
-	return domain, delay, nil
+	return host, delay, nil
 }
 
 func getWorkerColor() *color.Color {
@@ -658,49 +672,43 @@ func worker(workerID int, db *sql.DB, wg *sync.WaitGroup) {
 	c.Printf("Worker %d started\n", workerID)
 
 	for {
-		// Attempt to claim the next available domain
-		domain, crawlDelay, err := claimNextDomain(db, workerID)
+		host, crawlDelay, err := claimNextDomain(db, workerID)
 		if err != nil {
 			time.Sleep(5 * time.Second)
 			continue
 		}
-		c.Printf("Worker %d claimed domain %s\n", workerID, domain)
+		site := registrableDomainFromHost(host)
+		c.Printf("Worker %d claimed host %s (site %s)\n", workerID, host, site)
 
-		// Robots
-		robotsTXT, err := getDomainRobotsTXT(db, domain)
+		robotsTXT, err := getDomainRobotsTXT(db, host)
 		if err != nil || robotsTXT == "" {
-			c.Printf("(WORKER_%d) Fetching robots.txt for %s\n", workerID, domain)
-			robotsTXT, err = fetchRobotsTXT(domain)
+			c.Printf("(WORKER_%d) Fetching robots.txt for %s\n", workerID, host)
+			robotsTxt, err := fetchRobotsTXT(host)
 			if err != nil {
-				log.Printf("(WORKER_%d) Failed to fetch robots.txt for %s: %v", workerID, domain, err)
-				robotsTXT = ""
+				log.Printf("(WORKER_%d) Failed to fetch robots.txt for %s: %v", workerID, host, err)
+				robotsTxt = ""
 			}
-			saveDomain(db, domain, robotsTXT, time.Now())
+			saveDomain(db, host, site, robotsTxt, time.Now())
 		}
 
-		// Process URLs
-		processedCount := 0
 		for {
-			//Next URL
-			urlStr, err := getNextURLForDomain(db, domain)
+			urlStr, err := getNextURLForDomain(db, host)
 			if err != nil {
-				c.Printf("(WORKER_%d) No more URLs to process for domain %s\n", workerID, domain)
+				c.Printf("(WORKER_%d) No more URLs to process for host %s\n", workerID, host)
 				break
 			}
 
-			// Check domain against robots.txt
 			allowed, _ := canCrawlURL(robotsTXT, urlStr)
 			if !allowed {
-				c.Printf("(WORKER_%d) URL %s disallowed by robots.txt for domain %s\n", workerID, urlStr, domain)
+				c.Printf("(WORKER_%d) URL %s disallowed by robots.txt for host %s\n", workerID, urlStr, host)
 				markURLSkipped(db, urlStr, "disallowed by robots.txt")
 				continue
 			}
 
-			// Fetch Url
-			c.Printf("(WORKER_%d) Fetching URL %s for domain %s\n", workerID, urlStr, domain)
+			c.Printf("(WORKER_%d) Fetching URL %s (host %s)\n", workerID, urlStr, host)
 			resp, doc, bodyBytes, err := fetchURL(urlStr)
 			if err != nil {
-				log.Printf("(WORKER_%d) Failed to fetch URL %s for domain %s: %v", workerID, urlStr, domain, err)
+				log.Printf("(WORKER_%d) Failed to fetch URL %s for host %s: %v", workerID, urlStr, host, err)
 				markURLFailed(db, urlStr, err.Error())
 			} else {
 				links := parseLinks(doc, urlStr)
@@ -709,7 +717,6 @@ func worker(workerID int, db *sql.DB, wg *sync.WaitGroup) {
 				}
 				markURLFetched(db, urlStr)
 
-				// save to disk
 				if os.Getenv("SAVE_DATA") == "true" {
 					err = saveBodyToDisk(urlStr, bodyBytes)
 					if err != nil {
@@ -717,15 +724,12 @@ func worker(workerID int, db *sql.DB, wg *sync.WaitGroup) {
 					}
 				}
 
-				processedCount++
-
-				refreshClaim(db, domain, workerID)
+				refreshClaim(db, host, workerID)
 
 				c.Printf("(WORKER_%d) STATUS %d, Links found: %d\n", workerID, resp.StatusCode, len(links))
 			}
-			// Respect crawl delay
 			time.Sleep(time.Duration(crawlDelay) * time.Second)
 		}
-		releaseDomain(db, domain, workerID)
+		releaseDomain(db, host, workerID)
 	}
 }

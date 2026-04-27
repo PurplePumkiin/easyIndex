@@ -4,8 +4,18 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 )
+
+func tableHasColumn(db *sql.DB, table, column string) bool {
+	var n int
+	err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&n)
+	if err != nil {
+		return false
+	}
+	return n > 0
+}
 
 // Migration represents a database schema change
 type Migration struct {
@@ -77,35 +87,43 @@ func runMigrations(db *sql.DB) error {
 				}
 
 				log.Println("   Calculating link counts (this may take a while)...")
-				createTempQuery := `
+				urlHostCol := "domain"
+				if tableHasColumn(db, "urls", "host_domain") {
+					urlHostCol = "host_domain"
+				}
+				domHostCol := "domain"
+				if tableHasColumn(db, "domains", "host_domain") {
+					domHostCol = "host_domain"
+				}
+				createTempQuery := fmt.Sprintf(`
 					CREATE TEMP TABLE temp_link_counts AS
 					SELECT 
-						u1.domain as domain,
+						u1.%[1]s as domain,
 						COUNT(DISTINCT u2.id) as link_count
 					FROM urls u1
 					INNER JOIN urls u2 ON u1.url = u2.from_url
 					WHERE u1.status = 'fetched'
 						AND u2.status != 'skipped'
-						AND u1.domain != u2.domain
-					GROUP BY u1.domain
-				`
+						AND u1.%[1]s != u2.%[1]s
+					GROUP BY u1.%[1]s
+				`, urlHostCol)
 				_, err = db.Exec(createTempQuery)
 				if err != nil {
 					return fmt.Errorf("failed to create temp table: %v", err)
 				}
 
 				log.Println("   Applying bulk update...")
-				bulkUpdateQuery := `
+				bulkUpdateQuery := fmt.Sprintf(`
 					UPDATE domains
 					SET total_links_out = (
 						SELECT COALESCE(link_count, 0)
 						FROM temp_link_counts
-						WHERE temp_link_counts.domain = domains.domain
+						WHERE temp_link_counts.domain = domains.%[1]s
 					)
 					WHERE EXISTS (
-						SELECT 1 FROM temp_link_counts WHERE temp_link_counts.domain = domains.domain
+						SELECT 1 FROM temp_link_counts WHERE temp_link_counts.domain = domains.%[1]s
 					)
-				`
+				`, domHostCol)
 				result, err := db.Exec(bulkUpdateQuery)
 				if err != nil {
 					return fmt.Errorf("bulk update failed: %v", err)
@@ -140,30 +158,38 @@ func runMigrations(db *sql.DB) error {
 				}
 
 				log.Println("   Calculating URL counts (this may take a while)...")
-				createTempQuery := `
+				urlHostCol := "domain"
+				if tableHasColumn(db, "urls", "host_domain") {
+					urlHostCol = "host_domain"
+				}
+				domHostCol := "domain"
+				if tableHasColumn(db, "domains", "host_domain") {
+					domHostCol = "host_domain"
+				}
+				createTempQuery := fmt.Sprintf(`
 					CREATE TEMP TABLE temp_url_counts AS
-					SELECT domain, COUNT(*) as url_count
+					SELECT %[1]s as domain, COUNT(*) as url_count
 					FROM urls
 					WHERE status = 'fetched'
-					GROUP BY domain
-				`
+					GROUP BY %[1]s
+				`, urlHostCol)
 				_, err = db.Exec(createTempQuery)
 				if err != nil {
 					return fmt.Errorf("failed to create temp table: %v", err)
 				}
 
 				log.Println("   Applying bulk update...")
-				bulkUpdateQuery := `
+				bulkUpdateQuery := fmt.Sprintf(`
 					UPDATE domains
 					SET total_urls_fetched = (
 						SELECT COALESCE(url_count, 0)
 						FROM temp_url_counts
-						WHERE temp_url_counts.domain = domains.domain
+						WHERE temp_url_counts.domain = domains.%[1]s
 					)
 					WHERE EXISTS (
-						SELECT 1 FROM temp_url_counts WHERE temp_url_counts.domain = domains.domain
+						SELECT 1 FROM temp_url_counts WHERE temp_url_counts.domain = domains.%[1]s
 					)
-				`
+				`, domHostCol)
 				result, err := db.Exec(bulkUpdateQuery)
 				if err != nil {
 					return fmt.Errorf("bulk update failed: %v", err)
@@ -173,6 +199,12 @@ func runMigrations(db *sql.DB) error {
 				log.Printf("   ✅ Backfilled URL counts for %d domains\n", rowsAffected)
 
 				return nil
+			},
+		},
+		{
+			Name: "split_host_and_registrable_domain",
+			MigrateFunc: func(db *sql.DB) error {
+				return migrateHostRegistrableSplit(db)
 			},
 		},
 	}
@@ -204,5 +236,100 @@ func runMigrations(db *sql.DB) error {
 		log.Printf("✅ Migration '%s' completed in %v\n", migration.Name, duration)
 	}
 
+	return nil
+}
+
+func backfillURLRegistrableDomains(db *sql.DB) error {
+	rows, err := db.Query(`SELECT DISTINCT host_domain FROM urls WHERE host_domain IS NOT NULL AND host_domain != ''`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var host string
+		if err := rows.Scan(&host); err != nil {
+			return err
+		}
+		site := registrableDomainFromHost(host)
+		if _, err := db.Exec(`UPDATE urls SET domain = ? WHERE host_domain = ?`, site, host); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+func backfillDomainRegistrable(db *sql.DB) error {
+	rows, err := db.Query(`SELECT id, host_domain FROM domains WHERE host_domain IS NOT NULL AND host_domain != ''`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id int64
+		var host string
+		if err := rows.Scan(&id, &host); err != nil {
+			return err
+		}
+		site := registrableDomainFromHost(host)
+		if _, err := db.Exec(`UPDATE domains SET registrable_domain = ? WHERE id = ?`, site, id); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+func migrateHostRegistrableSplit(db *sql.DB) error {
+	log.Println("🔄 Migration: Splitting host (crawl identity) vs registrable domain (site bucket)...")
+
+	if !tableHasColumn(db, "urls", "host_domain") {
+		log.Println("   Adding urls.host_domain and copying legacy host from urls.domain...")
+		if _, err := db.Exec(`ALTER TABLE urls ADD COLUMN host_domain TEXT`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+			return err
+		}
+		if _, err := db.Exec(`UPDATE urls SET host_domain = domain WHERE host_domain IS NULL OR host_domain = ''`); err != nil {
+			return err
+		}
+	}
+
+	if err := backfillURLRegistrableDomains(db); err != nil {
+		return fmt.Errorf("backfill urls.domain (registrable): %w", err)
+	}
+
+	if tableHasColumn(db, "domains", "domain") {
+		log.Println("   Renaming domains.domain -> domains.host_domain...")
+		if _, err := db.Exec(`ALTER TABLE domains RENAME COLUMN domain TO host_domain`); err != nil {
+			return fmt.Errorf("rename domains.domain: %w", err)
+		}
+	}
+
+	if !tableHasColumn(db, "domains", "registrable_domain") {
+		log.Println("   Adding domains.registrable_domain...")
+		if _, err := db.Exec(`ALTER TABLE domains ADD COLUMN registrable_domain TEXT`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+			return err
+		}
+	}
+
+	if err := backfillDomainRegistrable(db); err != nil {
+		return fmt.Errorf("backfill domains.registrable_domain: %w", err)
+	}
+
+	log.Println("   Clearing domain_links (will be rebuilt by analytics using registrable domains)...")
+	if _, err := db.Exec(`DELETE FROM domain_links`); err != nil {
+		return err
+	}
+
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_urls_host_domain ON urls(host_domain)`); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_urls_registrable ON urls(domain)`); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_domains_registrable ON domains(registrable_domain)`); err != nil {
+		return err
+	}
+
+	log.Println("   ✅ Host vs registrable split complete")
 	return nil
 }
