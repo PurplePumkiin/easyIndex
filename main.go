@@ -265,8 +265,14 @@ func freshStartIfNeeded(db *sql.DB) error {
 	if err := initDB(db); err != nil {
 		return err
 	}
-	_, err = db.Exec(`INSERT INTO migrations (id, name, applied_at) VALUES (1, 'fresh_start', ?)`, time.Now())
-	return err
+	if _, err = db.Exec(`INSERT INTO migrations (id, name, applied_at) VALUES (1, 'fresh_start', ?)`, time.Now()); err != nil {
+		return err
+	}
+	// Truncate WAL after full reset so -wal does not keep carrying pre-reset pages on disk.
+	if _, err = db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		return fmt.Errorf("wal_checkpoint(TRUNCATE): %w", err)
+	}
+	return nil
 }
 
 // initDB ensures all application tables and indexes exist (domain_links and analytics-related objects live here).
