@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -49,15 +50,14 @@ func main() {
 	db.Exec(`PRAGMA journal_mode=WAL`)
 	defer db.Close()
 
+	err = freshStartIfNeeded(db)
+	if err != nil {
+		log.Fatal("Fresh-start database reset:", err)
+	}
+
 	err = initDB(db)
 	if err != nil {
 		log.Fatal("Failed to initialize database:", err)
-	}
-
-	// Run database migrations
-	err = runMigrations(db)
-	if err != nil {
-		log.Fatal("Failed to run migrations:", err)
 	}
 
 	// Seed the database with starting URL if empty
@@ -68,19 +68,6 @@ func main() {
 	analyticsFrequency := getEnvInt("FREQUENCY", 3600) // Default 1 hour
 	analyticsService := NewAnalyticsService(db, analyticsFrequency, analyticsEnabled)
 	analyticsService.Start()
-
-	// Start API Service
-	apiEnabled := os.Getenv("API") == "true"
-	apiMode := os.Getenv("REQUEST_MODE") // GET or POST
-	apiPort := os.Getenv("PORT")
-	if apiPort == "" {
-		apiPort = "8080"
-	}
-	apiDestination := os.Getenv("DESTINATION")
-	apiFrequency := getEnvInt("API_FREQUENCY", 300) // Default 5 minutes for POST mode
-
-	apiService := NewAPIService(db, apiEnabled, apiMode, apiPort, apiDestination, apiFrequency)
-	apiService.Start()
 
 	// Main crawl loop
 	for {
@@ -204,16 +191,100 @@ func initDir() {
 	}
 }
 
-// initDB creates tables and safe indexes only. Indexes on host_domain / registrable_domain
-// are created in migration split_host_and_registrable_domain so old DBs still work before that migration runs.
+// freshStartAlreadyApplied is true when this database has already completed the one-time nuclear reset.
+func freshStartAlreadyApplied(db *sql.DB) (bool, error) {
+	var n int
+	err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='migrations'`).Scan(&n)
+	if err != nil {
+		return false, err
+	}
+	if n == 0 {
+		return false, nil
+	}
+	err = db.QueryRow(`SELECT COUNT(*) FROM migrations WHERE name = 'fresh_start'`).Scan(&n)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// dropAllUserTables removes every non-internal SQLite table so we can recreate a clean schema.
+func dropAllUserTables(db *sql.DB) (err error) {
+	rows, err := db.Query(`SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return err
+		}
+		names = append(names, name)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	if _, err := db.Exec(`PRAGMA foreign_keys = OFF`); err != nil {
+		return err
+	}
+	defer func() {
+		if _, e := db.Exec(`PRAGMA foreign_keys = ON`); e != nil {
+			err = errors.Join(err, fmt.Errorf("PRAGMA foreign_keys=ON: %w", e))
+		}
+	}()
+
+	for _, name := range names {
+		quoted := `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+		if _, e := db.Exec("DROP TABLE IF EXISTS " + quoted); e != nil {
+			return e
+		}
+	}
+	return nil
+}
+
+// freshStartIfNeeded runs once per database file: drops every table, recreates empty urls/domains/migrations,
+// and records the fresh_start sentinel. Later startups see the row and skip this entirely.
+func freshStartIfNeeded(db *sql.DB) error {
+	done, err := freshStartAlreadyApplied(db)
+	if err != nil {
+		return err
+	}
+	if done {
+		return nil
+	}
+
+	log.Println("Database: one-time fresh_start — dropping all tables and recreating schema")
+
+	if err := dropAllUserTables(db); err != nil {
+		return err
+	}
+	if err := initDB(db); err != nil {
+		return err
+	}
+	_, err = db.Exec(`INSERT INTO migrations (id, name, applied_at) VALUES (1, 'fresh_start', ?)`, time.Now())
+	return err
+}
+
+// initDB ensures all application tables and indexes exist (domain_links and analytics-related objects live here).
 func initDB(db *sql.DB) error {
 	query := `
+	CREATE TABLE IF NOT EXISTS migrations (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL UNIQUE,
+		applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);
+
 	CREATE TABLE IF NOT EXISTS urls (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		url TEXT NOT NULL UNIQUE,
 		host_domain TEXT NOT NULL,
 		domain TEXT NOT NULL,
 		from_url TEXT,
+		from_domain TEXT,
 		status TEXT DEFAULT 'pending',
 		error TEXT,
 		fetched_at TIMESTAMP,
@@ -221,6 +292,7 @@ func initDB(db *sql.DB) error {
 	);
 	
 	CREATE INDEX IF NOT EXISTS inx_status ON urls(status);
+	CREATE INDEX IF NOT EXISTS idx_urls_host_domain ON urls(host_domain);
 	CREATE INDEX IF NOT EXISTS idx_urls_registrable ON urls(domain);
 
 	CREATE TABLE IF NOT EXISTS domains (
@@ -238,6 +310,12 @@ func initDB(db *sql.DB) error {
 		total_links_out INTEGER DEFAULT 0,
 		total_urls_fetched INTEGER DEFAULT 0
 	);
+	
+	CREATE TABLE IF NOT EXISTS domain_top (
+		position INTEGER PRIMARY KEY NOT NULL,
+		domain TEXT NOT NULL,
+		total_links_fetched INTEGER DEFAULT 0
+	);
 
 	CREATE TABLE IF NOT EXISTS domain_links (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -250,6 +328,14 @@ func initDB(db *sql.DB) error {
 
 	CREATE INDEX IF NOT EXISTS idx_source_domain ON domain_links(source_domain);
 	CREATE INDEX IF NOT EXISTS idx_link_count ON domain_links(link_count DESC);
+
+	CREATE TABLE IF NOT EXISTS analytics_worker (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		links_proccessed INTEGER DEFAULT 0,
+		time_taken_seconds INTEGER DEFAULT 0,
+		last_run TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		ending_id INTEGER DEFAULT 0
+	);
 	`
 
 	_, err := db.Exec(query)
@@ -336,7 +422,16 @@ func saveURL(db *sql.DB, urlStr string, fromURL string) error {
 		}
 	}
 
-	result, err := db.Exec(`INSERT OR IGNORE INTO urls (url, host_domain, domain, from_url) VALUES (?, ?, ?, ?)`, urlStr, host, site, fromURL)
+	fromDomain := ""
+	if fromURL != "" {
+		fromDomain, err = hostFromURLString(fromURL)
+		if err != nil {
+			return err
+		}
+		fromDomain = registrableDomainFromHost(fromDomain)
+	}
+
+	result, err := db.Exec(`INSERT OR IGNORE INTO urls (url, host_domain, domain, from_url, from_domain) VALUES (?, ?, ?, ?, ?)`, urlStr, host, site, fromURL, fromDomain)
 	if err != nil {
 		return err
 	}
