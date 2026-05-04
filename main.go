@@ -69,6 +69,19 @@ func main() {
 	analyticsService := NewAnalyticsService(db, analyticsFrequency, analyticsEnabled)
 	analyticsService.Start()
 
+	// Start API Service
+	apiEnabled := os.Getenv("API") == "true"
+	apiMode := os.Getenv("REQUEST_MODE") // GET or POST
+	apiPort := os.Getenv("PORT")
+	if apiPort == "" {
+		apiPort = "8080"
+	}
+	apiDestination := os.Getenv("DESTINATION")
+	apiFrequency := getEnvInt("API_FREQUENCY", 300) // Default 5 minutes for POST mode
+
+	apiService := NewAPIService(db, apiEnabled, apiMode, apiPort, apiDestination, apiFrequency)
+	apiService.Start()
+
 	// Main crawl loop
 	for {
 		// Initialize registry
