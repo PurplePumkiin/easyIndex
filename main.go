@@ -691,6 +691,7 @@ func refreshClaim(db *sql.DB, host string, workerID int) {
 }
 
 func claimNextDomain(db *sql.DB, workerID int) (string, int, error) {
+	log.Printf("Worker %d claiming next domain", workerID)
 	registryMutex.Lock()
 	defer registryMutex.Unlock()
 
@@ -700,9 +701,7 @@ func claimNextDomain(db *sql.DB, workerID int) (string, int, error) {
 	err := db.QueryRow(`
 		SELECT d.host_domain, d.crawl_delay
 		FROM domains d
-		INNER JOIN urls u ON d.host_domain = u.host_domain
-		WHERE u.status = 'pending'
-			AND (d.claimed_by IS NULL
+		WHERE (d.claimed_by IS NULL
 				OR d.claimed_at < datetime('now', '-5 minutes'))
 			AND (
 				SELECT COUNT(DISTINCT cx.claimed_by)
@@ -711,8 +710,12 @@ func claimNextDomain(db *sql.DB, workerID int) (string, int, error) {
 					AND cx.claimed_by IS NOT NULL
 					AND cx.claimed_at >= datetime('now', '-5 minutes')
 			) < ?
-		GROUP BY d.host_domain
-		ORDER BY MIN(u.created_at) ASC
+			AND EXISTS (
+				SELECT 1
+				FROM urls u
+				WHERE u.host_domain = d.host_domain
+					AND u.status = 'pending'
+			)
 		LIMIT 1
 	`, maxWorkersPerSite).Scan(&host, &crawlDelay)
 
@@ -744,6 +747,7 @@ func claimNextDomain(db *sql.DB, workerID int) (string, int, error) {
 	if crawlDelay.Valid {
 		delay = int(crawlDelay.Int64)
 	}
+	log.Printf("Worker %d claimed host %s with crawl delay %d", workerID, host, delay)
 	return host, delay, nil
 }
 
